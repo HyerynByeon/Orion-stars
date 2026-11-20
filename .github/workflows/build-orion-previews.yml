@@ -1,0 +1,153 @@
+name: Build Orion RAW previews
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: orion-raw-previews
+  cancel-in-progress: false
+
+jobs:
+  build-previews:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository and download Git LFS objects
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Verify all six LFS parts are real files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in Orion-ZIP-parts/*.part01; do
+            size=$(stat -c%s "$f")
+            echo "$f: $size bytes"
+            test "$size" -gt 1000000000
+          done
+          test "$(find Orion-ZIP-parts -maxdepth 1 -type f -name '*.part*' | wc -l)" -eq 6
+
+      - name: Reassemble and extract the three ZIP archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/orion-data"
+          for archive in \
+            "Orion Start to FInish - Nico Carver-20261120T023736Z-1-001" \
+            "Orion Start to FInish - Nico Carver-20261120T023736Z-1-002" \
+            "Orion Start to FInish - Nico Carver-20261120T023736Z-1-003"; do
+            echo "Extracting: $archive"
+            cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" | unzip -q - -d "$RUNNER_TEMP/orion-data"
+          done
+          test "$(find "$RUNNER_TEMP/orion-data" -type f -iname '*.CR2' | wc -l)" -eq 227
+          echo "All 227 CR2 files extracted."
+
+      - name: Free space before RAW conversion
+        shell: bash
+        run: |
+          rm -rf Orion-ZIP-parts .git/lfs/objects
+          df -h "$RUNNER_TEMP"
+
+      - name: Install RAW and metadata tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libimage-exiftool-perl
+          python -m pip install --upgrade pip
+          python -m pip install rawpy pillow
+
+      - name: Generate JPEG previews, contact sheets, and EXIF CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver"
+          mkdir -p previews/contact-sheets analysis
+          exiftool -csv -r -ext CR2 -FileName -Directory -Make -Model -LensModel -FocalLength -ExposureTime -FNumber -ISO -DateTimeOriginal "$DATA_DIR" > analysis/camera-metadata.csv
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import rawpy
+          from PIL import Image, ImageDraw
+          
+          root = Path("$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver")
+          out = Path("previews")
+          categories = ["lights", "darks", "flats", "bias"]
+          counts = {}
+          errors = []
+          
+          for category in categories:
+              files = sorted((root / category).glob("*.CR2"))
+              counts[category] = len(files)
+              thumbs = []
+              target = out / category
+              target.mkdir(parents=True, exist_ok=True)
+              
+              for source in files:
+                  try:
+                      with rawpy.imread(str(source)) as raw:
+                          rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+                      image = Image.fromarray(rgb)
+                      image.thumbnail((640, 640), Image.Resampling.LANCZOS)
+                      image.save(target / (source.stem + ".jpg"), "JPEG", quality=78, optimize=True)
+                      
+                      tile = image.copy()
+                      tile.thumbnail((190, 135), Image.Resampling.LANCZOS)
+                      thumbs.append((source.name, tile.copy()))
+                  except Exception as exc:
+                      errors.append(f"{source}: {exc}")
+              
+              if thumbs:
+                  cols, cell_w, cell_h = 5, 220, 170
+                  rows = (len(thumbs) + cols - 1) // cols
+                  sheet = Image.new("RGB", (cols * cell_w, rows * cell_h), "white")
+                  draw = ImageDraw.Draw(sheet)
+                  for i, (name, thumb) in enumerate(thumbs):
+                      x = (i % cols) * cell_w
+                      y = (i // cols) * cell_h
+                      sheet.paste(thumb, (x + (cell_w - thumb.width)//2, y + 4))
+                      draw.text((x + 6, y + 143), name, fill="black")
+                  sheet.save(out / "contact-sheets" / f"{category}.jpg", "JPEG", quality=85, optimize=True)
+          
+          with (Path("analysis") / "image-counts.csv").open("w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["folder", "CR2_count"])
+              for category in categories:
+                  writer.writerow([category, counts[category]])
+              writer.writerow(["TOTAL", sum(counts.values())])
+          
+          readme = [
+              "# Orion RAW previews",
+              "",
+              "JPEG previews generated from the 227 Canon CR2 files in the source dataset.",
+              "",
+              "## Contact sheets",
+              "",
+          ]
+          for category in categories:
+              readme.append(f"- [{category.title()} contact sheet](contact-sheets/{category}.jpg) — {counts[category]} images")
+          readme += ["", "## Individual previews", ""]
+          for category in categories:
+              readme.append(f"- [Open {category}/](./{category}/)")
+          (out / "README.md").write_text("\n".join(readme) + "\n")
+          
+          if errors:
+              Path("analysis/conversion-errors.txt").write_text("\n".join(errors) + "\n")
+          print("Counts:", counts, "TOTAL:", sum(counts.values()))
+          print("Conversion errors:", len(errors))
+          if sum(counts.values()) != 227 or errors:
+              raise SystemExit("Preview generation was incomplete; inspect the logs and analysis/conversion-errors.txt.")
+          PY
+
+      - name: Commit previews and analysis to the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add previews analysis
+          git commit --only previews analysis -m "Add Orion RAW previews and metadata"
+          git push
