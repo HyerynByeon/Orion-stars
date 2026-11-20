@@ -152,6 +152,21 @@ jobs:
               if actual != count:
                   raise RuntimeError(f"Expected {count} {name}, found {actual}")
 
+          # Determine one common visible sensor area from RAW headers before
+          # decoding. Some CR2 groups can expose slightly different active-area
+          # dimensions; center-cropping demosaiced RGB to the shared overlap
+          # prevents shape mismatches during calibration.
+          all_paths = [p for group in folders.values() for p in group]
+          visible_shapes = []
+          for i, path in enumerate(all_paths, 1):
+              with rawpy.imread(str(path)) as raw:
+                  visible_shapes.append(tuple(raw.raw_image_visible.shape))
+              if i % 25 == 0 or i == len(all_paths):
+                  print(f"Inspected RAW dimensions {i}/{len(all_paths)}")
+          target_h = min(shape[0] for shape in visible_shapes)
+          target_w = min(shape[1] for shape in visible_shapes)
+          print(f"Common RAW visible-area crop: {target_w}x{target_h}")
+
           # Decode consistently into linear, camera-RGB 16-bit data. No display
           # stretch or automatic white balance is applied before calibration.
           def decode(path):
@@ -165,7 +180,15 @@ jobs:
                       output_color=rawpy.ColorSpace.raw,
                       demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
                   )
-              return rgb.astype(np.float32)
+              rgb = rgb.astype(np.float32)
+              h, w = rgb.shape[:2]
+              if h < target_h or w < target_w:
+                  raise RuntimeError(
+                      f"{path.name}: decoded image {w}x{h} is smaller than common crop {target_w}x{target_h}"
+                  )
+              top = (h - target_h) // 2
+              left = (w - target_w) // 2
+              return rgb[top:top + target_h, left:left + target_w, :]
 
           def mean_master(paths, label):
               total = None
@@ -186,8 +209,11 @@ jobs:
           master_bias = mean_master(folders["bias"], "Bias")
           master_dark = mean_master(folders["darks"], "Dark")
           flat_mean = mean_master(folders["flats"], "Flat")
-          if master_bias.shape != master_dark.shape or master_bias.shape != flat_mean.shape:
-              raise RuntimeError("Calibration frame dimensions do not match.")
+          if not (master_bias.shape == master_dark.shape == flat_mean.shape):
+              raise RuntimeError(
+                  f"Calibration frame dimensions still differ after common crop: "
+                  f"bias={master_bias.shape}, dark={master_dark.shape}, flat={flat_mean.shape}"
+              )
 
           # Darks were exposed for 30 s at ISO 800, matching the Lights metadata.
           # The master dark includes its bias pedestal, so it is subtracted once.
@@ -304,7 +330,7 @@ jobs:
           Image.fromarray(preview, "RGB").save(out / "final_stack_preview.jpg", quality=95)
 
           report = {
-              "method": "Linear camera-RGB calibration after rawpy demosaicing; mean master frames; online aligned mean with 5-sigma rejection.",
+              "method": "Linear camera-RGB calibration after rawpy demosaicing; common centered crop based on minimum RAW visible-area dimensions; mean master frames; online aligned mean with 5-sigma rejection.",
               "counts": {k: len(v) for k, v in folders.items()},
               "registered_light_frames": registered_count,
               "registration_failures": failed,
@@ -314,6 +340,7 @@ jobs:
                   "The master dark includes its bias pedestal and is subtracted once from each Light.",
                   "The master bias is subtracted from Flats before flat normalization.",
                   "FNumber and FocalLength were recorded as zero in the supplied metadata, so optical settings could not be verified.",
+                  "All 227 CR2 files were inspected for visible RAW dimensions; decoded RGB frames were center-cropped to the shared minimum visible area. This assumes the sensor areas are centered consistently; verify star alignment and crop edges in the outputs.",
                   "This is a first-pass RGB-domain calibration, not raw-mosaic calibration; inspect the outputs before treating them as a final scientific master."
               ]
           }
