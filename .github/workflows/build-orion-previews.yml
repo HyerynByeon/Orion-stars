@@ -42,7 +42,7 @@ jobs:
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-002" \
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-003"; do
             echo "Extracting: $archive"
-            cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" | unzip -q - -d "$RUNNER_TEMP/orion-data"
+            cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" | unzip -oq - -d "$RUNNER_TEMP/orion-data"
           done
           test "$(find "$RUNNER_TEMP/orion-data" -type f -iname '*.CR2' | wc -l)" -eq 227
           echo "All 227 CR2 files extracted."
@@ -67,13 +67,14 @@ jobs:
           DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver"
           mkdir -p previews/contact-sheets analysis
           exiftool -csv -r -ext CR2 -FileName -Directory -Make -Model -LensModel -FocalLength -ExposureTime -FNumber -ISO -DateTimeOriginal "$DATA_DIR" > analysis/camera-metadata.csv
-          python - <<'PY'
+          DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver" python - <<'PY'
           from pathlib import Path
           import csv
+          import os
           import rawpy
           from PIL import Image, ImageDraw
           
-          root = Path("$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver")
+          root = Path(os.environ["DATA_DIR"])
           out = Path("previews")
           categories = ["lights", "darks", "flats", "bias"]
           counts = {}
