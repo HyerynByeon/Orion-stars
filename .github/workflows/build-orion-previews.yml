@@ -137,6 +137,7 @@ jobs:
           import rawpy
           import astroalign
           import tifffile
+          from skimage.transform import SimilarityTransform
           from astropy.io import fits
           from PIL import Image
 
@@ -221,6 +222,12 @@ jobs:
           ref_gray = (reference[:, :, 0] * 0.25 +
                       reference[:, :, 1] * 0.5 +
                       reference[:, :, 2] * 0.25)
+          # Detect stars on a 4x downsampled luminance image to reduce
+          # astroalign's memory use and make source detection less expensive.
+          # The recovered similarity transform is then scaled back to full
+          # resolution before warping the RGB frame.
+          detection_factor = 4
+          ref_detection = ref_gray[::detection_factor, ::detection_factor]
           running_mean = reference.copy()
           running_m2 = np.zeros_like(reference, dtype=np.float32)
           pixel_count = np.ones((h, w, 1), dtype=np.float32)
@@ -233,17 +240,20 @@ jobs:
                   gray = (calibrated[:, :, 0] * 0.25 +
                           calibrated[:, :, 1] * 0.5 +
                           calibrated[:, :, 2] * 0.25)
-                  transform, _ = astroalign.find_transform(gray, ref_gray)
-                  warped_channels = []
-                  footprints = []
-                  for channel in range(3):
-                      warped, footprint = astroalign.apply_transform(
-                          transform, calibrated[:, :, channel], ref_gray, fill_value=np.nan
-                      )
-                      warped_channels.append(warped.astype(np.float32))
-                      footprints.append(footprint)
-                  aligned = np.stack(warped_channels, axis=2)
-                  valid = np.logical_and.reduce(footprints)[:, :, None]
+                  moving_detection = gray[::detection_factor, ::detection_factor]
+                  small_transform, _ = astroalign.find_transform(moving_detection, ref_detection)
+                  # Convert the downsampled-image transform to full-resolution
+                  # pixel coordinates: translation scales, rotation/scale do not.
+                  transform = SimilarityTransform(
+                      scale=small_transform.scale,
+                      rotation=small_transform.rotation,
+                      translation=np.asarray(small_transform.translation) * detection_factor,
+                  )
+                  aligned, footprint = astroalign.apply_transform(
+                      transform, calibrated, reference, fill_value=0.0
+                  )
+                  aligned = aligned.astype(np.float32, copy=False)
+                  valid = (~footprint)[:, :, None]
                   valid &= np.all(np.isfinite(aligned), axis=2, keepdims=True)
                   # Online 5-sigma rejection limits isolated hot pixels and
                   # satellite/cosmic-ray outliers without retaining 73 full frames.
@@ -261,10 +271,15 @@ jobs:
                   registered_count += 1
                   if index % 10 == 0 or index == len(folders["lights"]):
                       print(f"Registered {index}/{len(folders['lights'])}: {path.name}")
-                  del calibrated, aligned, warped_channels, footprints
+                  del calibrated, aligned, footprint, gray, moving_detection
               except Exception as exc:
-                  failed.append({"file": path.name, "error": str(exc)})
-                  print(f"WARNING: could not register {path.name}: {exc}")
+                  failed.append({
+                      "file": path.name,
+                      "error": str(exc),
+                      "traceback": traceback.format_exc(),
+                  })
+                  print(f"WARNING: could not register {path.name}: {type(exc).__name__}: {exc}")
+                  print(traceback.format_exc())
 
           if registered_count < 2:
               raise RuntimeError("Too few Light frames could be aligned to create a stack.")
