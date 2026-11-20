@@ -1,4 +1,4 @@
-name: Build Orion RAW previews
+name: Build Orion RAW previews and stack
 
 on:
   workflow_dispatch:
@@ -37,8 +37,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/orion-data"
-          # The LFS objects are already checked out as ordinary files. Remove the
-          # duplicate LFS cache before reconstructing archives to save disk space.
           rm -rf .git/lfs/objects
           for archive in \
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-001" \
@@ -47,19 +45,18 @@ jobs:
             echo "Reassembling: $archive"
             zipfile="$RUNNER_TEMP/$archive.zip"
             cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" > "$zipfile"
-            echo "Extracting: $zipfile"
             unzip -oq "$zipfile" -d "$RUNNER_TEMP/orion-data"
             rm -f "$zipfile" "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02"
           done
           test "$(find "$RUNNER_TEMP/orion-data" -type f -iname '*.CR2' | wc -l)" -eq 227
           echo "All 227 CR2 files extracted."
 
-      - name: Install RAW and metadata tools
+      - name: Install RAW and processing tools
         run: |
           sudo apt-get update
           sudo apt-get install -y libimage-exiftool-perl
           python -m pip install --upgrade pip
-          python -m pip install rawpy pillow
+          python -m pip install rawpy pillow numpy scipy astropy tifffile astroalign
 
       - name: Generate JPEG previews, contact sheets, and EXIF CSV
         shell: bash
@@ -68,26 +65,22 @@ jobs:
           DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver"
           mkdir -p previews/contact-sheets analysis
           exiftool -csv -r -ext CR2 -FileName -Directory -Make -Model -LensModel -FocalLength -ExposureTime -FNumber -ISO -DateTimeOriginal "$DATA_DIR" > analysis/camera-metadata.csv
-          DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver" python - <<'PY'
+          DATA_DIR="$DATA_DIR" python - <<'PY'
           from pathlib import Path
-          import csv
-          import os
-          import rawpy
+          import csv, os, rawpy
           from PIL import Image, ImageDraw
-          
+
           root = Path(os.environ["DATA_DIR"])
           out = Path("previews")
           categories = ["lights", "darks", "flats", "bias"]
-          counts = {}
-          errors = []
-          
+          counts, errors = {}, []
+
           for category in categories:
               files = sorted((root / category).glob("*.CR2"))
               counts[category] = len(files)
               thumbs = []
               target = out / category
               target.mkdir(parents=True, exist_ok=True)
-              
               for source in files:
                   try:
                       with rawpy.imread(str(source)) as raw:
@@ -95,54 +88,233 @@ jobs:
                       image = Image.fromarray(rgb)
                       image.thumbnail((640, 640), Image.Resampling.LANCZOS)
                       image.save(target / (source.stem + ".jpg"), "JPEG", quality=78, optimize=True)
-                      
                       tile = image.copy()
                       tile.thumbnail((190, 135), Image.Resampling.LANCZOS)
                       thumbs.append((source.name, tile.copy()))
                   except Exception as exc:
                       errors.append(f"{source}: {exc}")
-              
               if thumbs:
                   cols, cell_w, cell_h = 5, 220, 170
                   rows = (len(thumbs) + cols - 1) // cols
                   sheet = Image.new("RGB", (cols * cell_w, rows * cell_h), "white")
                   draw = ImageDraw.Draw(sheet)
                   for i, (name, thumb) in enumerate(thumbs):
-                      x = (i % cols) * cell_w
-                      y = (i // cols) * cell_h
+                      x, y = (i % cols) * cell_w, (i // cols) * cell_h
                       sheet.paste(thumb, (x + (cell_w - thumb.width)//2, y + 4))
                       draw.text((x + 6, y + 143), name, fill="black")
                   sheet.save(out / "contact-sheets" / f"{category}.jpg", "JPEG", quality=85, optimize=True)
-          
+
           with (Path("analysis") / "image-counts.csv").open("w", newline="") as f:
               writer = csv.writer(f)
               writer.writerow(["folder", "CR2_count"])
               for category in categories:
                   writer.writerow([category, counts[category]])
               writer.writerow(["TOTAL", sum(counts.values())])
-          
-          readme = [
-              "# Orion RAW previews",
-              "",
-              "JPEG previews generated from the 227 Canon CR2 files in the source dataset.",
-              "",
-              "## Contact sheets",
-              "",
-          ]
+
+          readme = ["# Orion RAW previews", "", "JPEG previews generated from the 227 Canon CR2 files.", "", "## Contact sheets", ""]
           for category in categories:
               readme.append(f"- [{category.title()} contact sheet](contact-sheets/{category}.jpg) — {counts[category]} images")
           readme += ["", "## Individual previews", ""]
           for category in categories:
               readme.append(f"- [Open {category}/](./{category}/)")
           (out / "README.md").write_text("\n".join(readme) + "\n")
-          
           if errors:
               Path("analysis/conversion-errors.txt").write_text("\n".join(errors) + "\n")
           print("Counts:", counts, "TOTAL:", sum(counts.values()))
           print("Conversion errors:", len(errors))
           if sum(counts.values()) != 227 or errors:
-              raise SystemExit("Preview generation was incomplete; inspect the logs and analysis/conversion-errors.txt.")
+              raise SystemExit("Preview generation was incomplete; inspect conversion-errors.txt.")
           PY
+
+      - name: Calibrate, align, and stack the 73 Light frames
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATA_DIR="$RUNNER_TEMP/orion-data/Orion Start to FInish - Nico Carver" python - <<'PY'
+          from pathlib import Path
+          import csv, os, json, traceback
+          import numpy as np
+          import rawpy
+          import astroalign
+          import tifffile
+          from astropy.io import fits
+          from PIL import Image
+
+          root = Path(os.environ["DATA_DIR"])
+          out = Path("processing-results")
+          out.mkdir(exist_ok=True)
+          folders = {name: sorted((root / name).glob("*.CR2")) for name in ("lights", "darks", "flats", "bias")}
+          expected = {"lights": 73, "darks": 25, "flats": 29, "bias": 100}
+          for name, count in expected.items():
+              actual = len(folders[name])
+              print(f"{name}: {actual} CR2")
+              if actual != count:
+                  raise RuntimeError(f"Expected {count} {name}, found {actual}")
+
+          # Decode consistently into linear, camera-RGB 16-bit data. No display
+          # stretch or automatic white balance is applied before calibration.
+          def decode(path):
+              with rawpy.imread(str(path)) as raw:
+                  rgb = raw.postprocess(
+                      output_bps=16,
+                      gamma=(1, 1),
+                      no_auto_bright=True,
+                      use_camera_wb=False,
+                      use_auto_wb=False,
+                      output_color=rawpy.ColorSpace.raw,
+                      demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                  )
+              return rgb.astype(np.float32)
+
+          def mean_master(paths, label):
+              total = None
+              shape = None
+              for i, path in enumerate(paths, 1):
+                  arr = decode(path)
+                  if shape is None:
+                      shape = arr.shape
+                      total = np.zeros(shape, dtype=np.float32)
+                  if arr.shape != shape:
+                      raise RuntimeError(f"{label} frame dimensions differ: {path.name} {arr.shape} != {shape}")
+                  total += arr
+                  if i % 10 == 0 or i == len(paths):
+                      print(f"{label}: decoded {i}/{len(paths)}")
+                  del arr
+              return total / np.float32(len(paths))
+
+          master_bias = mean_master(folders["bias"], "Bias")
+          master_dark = mean_master(folders["darks"], "Dark")
+          flat_mean = mean_master(folders["flats"], "Flat")
+          if master_bias.shape != master_dark.shape or master_bias.shape != flat_mean.shape:
+              raise RuntimeError("Calibration frame dimensions do not match.")
+
+          # Darks were exposed for 30 s at ISO 800, matching the Lights metadata.
+          # The master dark includes its bias pedestal, so it is subtracted once.
+          flat_corrected = np.maximum(flat_mean - master_bias, 1.0)
+          channel_medians = np.median(flat_corrected, axis=(0, 1))
+          if np.any(channel_medians <= 0):
+              raise RuntimeError(f"Invalid flat normalization: {channel_medians}")
+          master_flat = flat_corrected / channel_medians.reshape((1, 1, 3))
+          if not np.all(np.isfinite(master_flat)):
+              raise RuntimeError("Master flat contains invalid values.")
+
+          def save_master(name, arr):
+              tifffile.imwrite(out / f"{name}.tif",
+                               np.clip(arr, 0, 65535).astype(np.uint16),
+                               photometric="rgb", compression="zlib")
+
+          save_master("master_bias", master_bias)
+          save_master("master_dark", master_dark)
+          save_master("master_flat", master_flat * 16000.0)
+
+          def calibrate(path):
+              light = decode(path)
+              if light.shape != master_dark.shape:
+                  raise RuntimeError(f"Light dimensions differ: {path.name} {light.shape}")
+              calibrated = (light - master_dark) / np.maximum(master_flat, 1e-6)
+              return np.nan_to_num(calibrated, nan=0.0, posinf=0.0, neginf=0.0)
+
+          reference = calibrate(folders["lights"][0])
+          h, w, channels = reference.shape
+          if channels != 3:
+              raise RuntimeError(f"Expected 3-channel RGB output, got {reference.shape}")
+          ref_gray = (reference[:, :, 0] * 0.25 +
+                      reference[:, :, 1] * 0.5 +
+                      reference[:, :, 2] * 0.25)
+          running_mean = reference.copy()
+          running_m2 = np.zeros_like(reference, dtype=np.float32)
+          pixel_count = np.ones((h, w, 1), dtype=np.float32)
+          registered_count = 1
+          failed = []
+
+          for index, path in enumerate(folders["lights"][1:], 2):
+              try:
+                  calibrated = calibrate(path)
+                  gray = (calibrated[:, :, 0] * 0.25 +
+                          calibrated[:, :, 1] * 0.5 +
+                          calibrated[:, :, 2] * 0.25)
+                  transform, _ = astroalign.find_transform(gray, ref_gray)
+                  warped_channels = []
+                  footprints = []
+                  for channel in range(3):
+                      warped, footprint = astroalign.apply_transform(
+                          transform, calibrated[:, :, channel], ref_gray, fill_value=np.nan
+                      )
+                      warped_channels.append(warped.astype(np.float32))
+                      footprints.append(footprint)
+                  aligned = np.stack(warped_channels, axis=2)
+                  valid = np.logical_and.reduce(footprints)[:, :, None]
+                  valid &= np.all(np.isfinite(aligned), axis=2, keepdims=True)
+                  # Online 5-sigma rejection limits isolated hot pixels and
+                  # satellite/cosmic-ray outliers without retaining 73 full frames.
+                  enough = pixel_count >= 3
+                  variance = running_m2 / np.maximum(pixel_count - 1, 1)
+                  sigma = np.sqrt(np.maximum(variance, 1.0))
+                  accept = valid & (~enough | (np.all(np.abs(aligned - running_mean) <= 5.0 * sigma, axis=2, keepdims=True)))
+                  new_count = pixel_count + accept.astype(np.float32)
+                  delta = aligned - running_mean
+                  ratio = accept.astype(np.float32) / np.maximum(new_count, 1.0)
+                  updated_mean = running_mean + delta * ratio
+                  running_m2 += accept.astype(np.float32) * delta * (aligned - updated_mean)
+                  running_mean = updated_mean
+                  pixel_count = new_count
+                  registered_count += 1
+                  if index % 10 == 0 or index == len(folders["lights"]):
+                      print(f"Registered {index}/{len(folders['lights'])}: {path.name}")
+                  del calibrated, aligned, warped_channels, footprints
+              except Exception as exc:
+                  failed.append({"file": path.name, "error": str(exc)})
+                  print(f"WARNING: could not register {path.name}: {exc}")
+
+          if registered_count < 2:
+              raise RuntimeError("Too few Light frames could be aligned to create a stack.")
+          if failed:
+              (out / "registration-errors.json").write_text(json.dumps(failed, indent=2))
+          stack = running_mean
+          stack[pixel_count[:, :, 0] == 0] = 0
+
+          fits.PrimaryHDU(stack.astype(np.float32)).writeto(out / "stacked_linear.fits", overwrite=True)
+          tifffile.imwrite(out / "stacked_linear.tif", stack.astype(np.float32),
+                           photometric="rgb", compression="zlib")
+
+          # Create a viewable asinh-stretched JPEG; the FITS/TIFF remain the
+          # linear processing outputs for subsequent scientific adjustments.
+          positive = np.maximum(stack, 0)
+          scale = np.percentile(positive, 99.8)
+          if not np.isfinite(scale) or scale <= 0:
+              raise RuntimeError("Stack has no usable positive signal.")
+          stretched = np.arcsinh(positive / (scale * 0.08))
+          stretched /= max(float(np.percentile(stretched, 99.8)), 1e-6)
+          preview = np.clip(stretched * 255, 0, 255).astype(np.uint8)
+          Image.fromarray(preview, "RGB").save(out / "final_stack_preview.jpg", quality=95)
+
+          report = {
+              "method": "Linear camera-RGB calibration after rawpy demosaicing; mean master frames; online aligned mean with 5-sigma rejection.",
+              "counts": {k: len(v) for k, v in folders.items()},
+              "registered_light_frames": registered_count,
+              "registration_failures": failed,
+              "image_shape": list(stack.shape),
+              "dark_matches_light_exposure_and_iso_per_supplied_metadata": True,
+              "notes": [
+                  "The master dark includes its bias pedestal and is subtracted once from each Light.",
+                  "The master bias is subtracted from Flats before flat normalization.",
+                  "FNumber and FocalLength were recorded as zero in the supplied metadata, so optical settings could not be verified.",
+                  "This is a first-pass RGB-domain calibration, not raw-mosaic calibration; inspect the outputs before treating them as a final scientific master."
+              ]
+          }
+          (out / "processing-report.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          if registered_count < 60:
+              raise RuntimeError(f"Only {registered_count}/73 Lights registered; inspect alignment errors before accepting this stack.")
+          PY
+
+      - name: Upload calibrated masters and stacked results
+        uses: actions/upload-artifact@v4
+        with:
+          name: Orion-calibration-and-stacking-results
+          path: processing-results/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Commit previews and analysis to the repository
         shell: bash
@@ -151,5 +323,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add previews analysis
-          git commit --only previews analysis -m "Add Orion RAW previews and metadata"
+          git commit --only previews analysis -m "Add Orion RAW previews and metadata" || echo "No preview or metadata changes to commit."
           git push
