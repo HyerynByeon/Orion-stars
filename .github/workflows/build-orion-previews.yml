@@ -37,21 +37,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/orion-data"
+          # The LFS objects are already checked out as ordinary files. Remove the
+          # duplicate LFS cache before reconstructing archives to save disk space.
+          rm -rf .git/lfs/objects
           for archive in \
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-001" \
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-002" \
             "Orion Start to FInish - Nico Carver-20261120T023736Z-1-003"; do
-            echo "Extracting: $archive"
-            cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" | unzip -oq - -d "$RUNNER_TEMP/orion-data"
+            echo "Reassembling: $archive"
+            zipfile="$RUNNER_TEMP/$archive.zip"
+            cat "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02" > "$zipfile"
+            echo "Extracting: $zipfile"
+            unzip -oq "$zipfile" -d "$RUNNER_TEMP/orion-data"
+            rm -f "$zipfile" "Orion-ZIP-parts/$archive.zip.part01" "Orion-ZIP-parts/$archive.zip.part02"
           done
           test "$(find "$RUNNER_TEMP/orion-data" -type f -iname '*.CR2' | wc -l)" -eq 227
           echo "All 227 CR2 files extracted."
-
-      - name: Free space before RAW conversion
-        shell: bash
-        run: |
-          rm -rf Orion-ZIP-parts .git/lfs/objects
-          df -h "$RUNNER_TEMP"
 
       - name: Install RAW and metadata tools
         run: |
