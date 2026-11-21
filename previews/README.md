@@ -1,6 +1,6 @@
 # Orion RAW previews
 
-JPEG previews generated from the 227 Canon CR2 files in the source dataset.
+JPEG previews generated from the 227 Canon CR2 files.
 
 ## Contact sheets
 
